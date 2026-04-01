@@ -42,7 +42,13 @@ interface Excerpt {
 }
 
 // ─── 키워드로 판례 텍스트에서 관련 문단 추출 ───
-function extractExcerpts(detail: PrecedentDetail, contextKeywords: string[]): Excerpt[] {
+type MatchMode = 'OR' | 'AND';
+
+function extractExcerpts(
+  detail: PrecedentDetail,
+  contextKeywords: string[],
+  matchMode: MatchMode = 'OR',
+): Excerpt[] {
   if (contextKeywords.length === 0) return [];
 
   const sections: { name: string; text: string }[] = [
@@ -65,7 +71,14 @@ function extractExcerpts(detail: PrecedentDetail, contextKeywords: string[]): Ex
       const matched = contextKeywords.filter((kw) =>
         para.toLowerCase().includes(kw.toLowerCase()),
       );
-      if (matched.length > 0) {
+
+      // AND: 모든 키워드가 포함된 문단만, OR: 하나라도 포함되면 선택
+      const isMatch =
+        matchMode === 'AND'
+          ? matched.length === contextKeywords.length
+          : matched.length > 0;
+
+      if (isMatch) {
         // 중복 방지 — 같은 텍스트가 이미 있으면 스킵
         const isDup = excerpts.some(
           (e) => e.text === para || para.includes(e.text) || e.text.includes(para),
@@ -111,6 +124,19 @@ function HighlightedText({ text, keywords }: { text: string; keywords: string[] 
   );
 }
 
+// ─── 검색어 자동 확장 매핑 ───
+// 사건명 검색의 한계를 보완: 관련 키워드로 추가 검색하여 결과를 확대
+const RELATED_KEYWORDS: Record<string, string[]> = {
+  '지급명령': ['대여금', '금전채권', '채권추심', '약속어음'],
+  '가압류': ['보전처분', '가압류이의', '채권가압류', '부동산가압류'],
+  '가처분': ['처분금지가처분', '임시지위', '직무집행정지', '보전처분'],
+  '대여금': ['금전소비대차', '차용금', '이자', '원리금'],
+  '임대차': ['건물명도', '임차보증금', '임차권', '주택임대차'],
+  '매매대금': ['매매계약', '매매대금반환', '소유권이전', '계약해제'],
+  '손해배상': ['불법행위', '채무불이행', '위자료', '손배'],
+  '부당이득': ['부당이득반환', '이득반환', '법률상원인'],
+};
+
 // ─── 추천 검색어 ───
 const SUGGESTED_SEARCHES = [
   { label: '지급명령', context: '소멸시효 중단' },
@@ -132,7 +158,84 @@ export default function PrecedentSearchPage() {
   const [searchDone, setSearchDone] = useState(false);
   const [analysisProgress, setAnalysisProgress] = useState({ current: 0, total: 0 });
 
-  // 판례 검색 + 전문 분석
+  const [fallbackInfo, setFallbackInfo] = useState<string | null>(null);
+  const [extraKeywords, setExtraKeywords] = useState<string[]>([]);
+  const [matchMode, setMatchMode] = useState<MatchMode>('OR');
+
+  // 판례 검색 API 호출 헬퍼
+  async function searchPrecedentAPI(keyword: string, display = 20, page = 1) {
+    const res = await fetch(
+      `/api/law/precedent?mode=search&query=${encodeURIComponent(keyword)}&display=${display}&page=${page}`,
+    );
+    const json = await res.json();
+    if (!json.success || !json.data?.PrecSearch) return { items: [], total: 0 };
+    const raw = json.data.PrecSearch;
+    const precs = Array.isArray(raw.prec) ? raw.prec : raw.prec ? [raw.prec] : [];
+    return {
+      total: parseInt(raw.totalCnt || '0', 10),
+      items: precs.map((p: Record<string, string>) => ({
+        id: p['판례일련번호'] || '',
+        caseName: p['사건명'] || '',
+        caseNumber: p['사건번호'] || '',
+        courtName: p['법원명'] || '',
+        judgmentDate: p['선고일자'] || '',
+        judgmentType: p['판결유형'] || '',
+      })) as PrecedentListItem[],
+    };
+  }
+
+  // 판례 1건 분석 워커
+  async function analyzeOne(
+    item: PrecedentListItem,
+    contextKeywords: string[],
+    mode: MatchMode,
+  ): Promise<AnalyzedPrecedent> {
+    try {
+      const textRes = await fetch(`/api/law/precedent-text?id=${item.id}`);
+      const textJson = await textRes.json();
+
+      if (textJson.success && textJson.data) {
+        const detail = textJson.data as PrecedentDetail;
+        const excerpts = extractExcerpts(detail, contextKeywords, mode);
+        return { info: item, detail, loading: false, error: null, excerpts };
+      }
+      return { info: item, detail: null, loading: false, error: '전문 조회 실패', excerpts: [] };
+    } catch {
+      return { info: item, detail: null, loading: false, error: '네트워크 오류', excerpts: [] };
+    }
+  }
+
+  // 병렬 분석 — CONCURRENCY개의 워커가 동시에 판례를 분석
+  const CONCURRENCY = 10;
+
+  async function analyzeBatch(
+    items: PrecedentListItem[],
+    contextKeywords: string[],
+    baseIndex: number,
+    mode: MatchMode,
+  ): Promise<{ analyzed: AnalyzedPrecedent[]; matchCount: number }> {
+    let matchCount = 0;
+    let completed = 0;
+
+    // CONCURRENCY개씩 묶어서 병렬 처리
+    for (let start = 0; start < items.length; start += CONCURRENCY) {
+      const chunk = items.slice(start, start + CONCURRENCY);
+      const promises = chunk.map((item) => analyzeOne(item, contextKeywords, mode));
+      const results = await Promise.all(promises);
+
+      for (const result of results) {
+        if (result.excerpts.length > 0) matchCount++;
+        setPrecedents((prev) => [...prev, result]);
+      }
+
+      completed += chunk.length;
+      setAnalysisProgress((prev) => ({ ...prev, current: baseIndex + completed }));
+    }
+
+    return { analyzed: [], matchCount };
+  }
+
+  // 판례 검색 + 전문 분석 (맥락 일치 없으면 자동 추가 검색)
   const handleSearch = useCallback(async (query?: string, context?: string) => {
     const q = query || searchQuery;
     const ctx = context || contextInput;
@@ -144,16 +247,81 @@ export default function PrecedentSearchPage() {
     setIsSearching(true);
     setSearchDone(false);
     setPrecedents([]);
+    setFallbackInfo(null);
+    setExtraKeywords([]);
     setAnalysisProgress({ current: 0, total: 0 });
 
-    try {
-      // 1. 판례 검색
-      const searchRes = await fetch(
-        `/api/law/precedent?mode=search&query=${encodeURIComponent(q)}&display=20`,
-      );
-      const searchJson = await searchRes.json();
+    let extraContextKeywords: string[] = [];
+    let searchKeyword = q;
 
-      if (!searchJson.success || !searchJson.data?.PrecSearch) {
+    try {
+      // 1. 판례 검색 — 원래 검색어 + 관련 키워드 병합 검색
+      let result = await searchPrecedentAPI(q, 20);
+
+      // 결과가 0건이면 단어를 쪼개서 재시도
+      if (result.items.length === 0) {
+        const words = q.split(/\s+/).filter((w) => w.length > 0);
+
+        if (words.length > 1) {
+          let bestWord = '';
+          let bestCount = 0;
+
+          for (const word of words) {
+            const test = await searchPrecedentAPI(word, 1);
+            if (test.total > bestCount) {
+              bestCount = test.total;
+              bestWord = word;
+            }
+          }
+
+          if (bestWord && bestCount > 0) {
+            result = await searchPrecedentAPI(bestWord, 20);
+            searchKeyword = bestWord;
+            const otherWords = words.filter((w) => w !== bestWord);
+            extraContextKeywords = otherWords;
+            setExtraKeywords(otherWords);
+
+            setFallbackInfo(
+              `"${q}"(으)로 검색 결과가 없어, "${bestWord}"(으)로 검색하고 나머지 키워드(${otherWords.join(', ')})는 판례 전문에서 맥락 검색합니다.`,
+            );
+          }
+        }
+      }
+
+      // 관련 키워드 확장 검색 — 원래 결과에 추가
+      const relatedKws = RELATED_KEYWORDS[q] || RELATED_KEYWORDS[searchKeyword] || [];
+      const seenIds = new Set(result.items.map((item) => item.id));
+      const expandedKeywords: string[] = [];
+
+      if (relatedKws.length > 0) {
+        // 관련 키워드를 병렬로 검색
+        const relatedPromises = relatedKws.map((kw) => searchPrecedentAPI(kw, 20));
+        const relatedResults = await Promise.all(relatedPromises);
+
+        for (let i = 0; i < relatedResults.length; i++) {
+          const r = relatedResults[i];
+          let added = 0;
+          for (const item of r.items) {
+            if (!seenIds.has(item.id)) {
+              seenIds.add(item.id);
+              result.items.push(item);
+              added++;
+            }
+          }
+          if (added > 0) expandedKeywords.push(relatedKws[i]);
+          result.total += r.total;
+        }
+
+        if (expandedKeywords.length > 0) {
+          setFallbackInfo((prev) => {
+            const base = prev || '';
+            const msg = `관련 키워드(${expandedKeywords.join(', ')})로 확장 검색하여 총 ${result.items.length}건을 수집했습니다.`;
+            return base ? base + '\n' + msg : msg;
+          });
+        }
+      }
+
+      if (result.items.length === 0) {
         setPrecedents([]);
         setTotalCount(0);
         setSearchDone(true);
@@ -161,66 +329,97 @@ export default function PrecedentSearchPage() {
         return;
       }
 
-      const raw = searchJson.data.PrecSearch;
-      setTotalCount(parseInt(raw.totalCnt || '0', 10));
+      setTotalCount(result.items.length);
 
-      const items: PrecedentListItem[] = (
-        Array.isArray(raw.prec) ? raw.prec : raw.prec ? [raw.prec] : []
-      ).map((p: Record<string, string>) => ({
-        id: p['판례일련번호'] || '',
-        caseName: p['사건명'] || '',
-        caseNumber: p['사건번호'] || '',
-        courtName: p['법원명'] || '',
-        judgmentDate: p['선고일자'] || '',
-        judgmentType: p['판결유형'] || '',
-      }));
+      // 맥락 키워드 구성
+      const contextKeywords = [
+        ...ctx.split(/[,\s]+/).map((k) => k.trim()).filter((k) => k.length > 0),
+        ...extraContextKeywords,
+      ];
 
-      // 초기 상태 세팅
-      const initial: AnalyzedPrecedent[] = items.map((info) => ({
-        info,
-        detail: null,
-        loading: true,
-        error: null,
-        excerpts: [],
-      }));
-      setPrecedents(initial);
-      setAnalysisProgress({ current: 0, total: items.length });
+      const hasContextKeywords = contextKeywords.length > 0;
 
-      // 2. 각 판례의 전문을 순차 조회 + 맥락 분석
-      const contextKeywords = ctx
-        .split(/[,\s]+/)
-        .map((k) => k.trim())
-        .filter((k) => k.length > 0);
+      // 2. 수집된 판례를 배치별로 병렬 분석
+      //    - 확장 검색으로 수집한 items를 먼저 모두 분석
+      //    - 맥락 일치 0건이면 원래 검색어로 추가 페이지 탐색
+      const allItems = [...result.items];
+      const totalToAnalyze = allItems.length;
+      let totalAnalyzed = 0;
+      let totalMatched = 0;
 
-      for (let i = 0; i < items.length; i++) {
-        try {
-          const textRes = await fetch(`/api/law/precedent-text?id=${items[i].id}`);
-          const textJson = await textRes.json();
+      setAnalysisProgress({ current: 0, total: totalToAnalyze });
 
-          if (textJson.success && textJson.data) {
-            const detail = textJson.data as PrecedentDetail;
-            const excerpts = extractExcerpts(detail, contextKeywords);
+      // 수집된 items를 배치(CONCURRENCY)로 분석
+      const ANALYZE_BATCH = 20;
+      for (let start = 0; start < allItems.length; start += ANALYZE_BATCH) {
+        const chunk = allItems.slice(start, start + ANALYZE_BATCH);
+        const { matchCount } = await analyzeBatch(
+          chunk,
+          contextKeywords,
+          totalAnalyzed,
+          matchMode,
+        );
+        totalAnalyzed += chunk.length;
+        totalMatched += matchCount;
 
-            setPrecedents((prev) =>
-              prev.map((p, idx) =>
-                idx === i ? { ...p, detail, loading: false, excerpts } : p,
-              ),
+        if (!hasContextKeywords) break;
+
+        setAnalysisProgress({ current: totalAnalyzed, total: totalToAnalyze });
+      }
+
+      // 맥락 일치 0건이고, 원래 검색어에 추가 페이지가 있으면 계속 탐색
+      if (totalMatched === 0 && hasContextKeywords) {
+        // 이미 로드한 페이지 수 계산 (원래 검색어 기준)
+        const originalResult = await searchPrecedentAPI(searchKeyword, 1);
+        const originalTotal = originalResult.total;
+        let currentPage = Math.ceil(result.items.filter((item) =>
+          !relatedKws.some(() => false) // 원래 검색어 결과의 대략적 페이지 수
+        ).length / 20) + 1;
+
+        const MAX_EXTRA = 500;
+        let extraAnalyzed = 0;
+
+        while (extraAnalyzed < MAX_EXTRA && totalAnalyzed < originalTotal + totalToAnalyze) {
+          const nextResult = await searchPrecedentAPI(searchKeyword, 20, currentPage);
+          if (nextResult.items.length === 0) break;
+
+          // 이미 분석한 ID 제외
+          const newItems = nextResult.items.filter((item) => !seenIds.has(item.id));
+          for (const item of newItems) seenIds.add(item.id);
+
+          if (newItems.length > 0) {
+            const { matchCount } = await analyzeBatch(
+              newItems,
+              contextKeywords,
+              totalAnalyzed,
+              matchMode,
             );
-          } else {
-            setPrecedents((prev) =>
-              prev.map((p, idx) =>
-                idx === i ? { ...p, loading: false, error: '전문 조회 실패' } : p,
-              ),
-            );
+            totalAnalyzed += newItems.length;
+            totalMatched += matchCount;
+            extraAnalyzed += newItems.length;
+
+            setAnalysisProgress({ current: totalAnalyzed, total: totalAnalyzed });
+
+            if (totalMatched > 0) break; // 일치 발견 시 종료
           }
-        } catch {
-          setPrecedents((prev) =>
-            prev.map((p, idx) =>
-              idx === i ? { ...p, loading: false, error: '네트워크 오류' } : p,
-            ),
-          );
+
+          currentPage++;
+
+          setFallbackInfo((prev) => {
+            const base = (prev || '').split('\n').filter(line => !line.includes('건 분석')).join('\n');
+            const msg = `\n${totalAnalyzed}건 분석, 맥락 일치 0건 → 추가 탐색 중...`;
+            return base ? base + msg : msg.trim();
+          });
         }
-        setAnalysisProgress({ current: i + 1, total: items.length });
+      }
+
+      // 최종 안내
+      if (totalMatched === 0 && hasContextKeywords) {
+        setFallbackInfo((prev) => {
+          const base = (prev || '').split('\n').filter(line => !line.includes('건 분석')).join('\n');
+          const msg = `\n총 ${totalAnalyzed}건 분석 완료 — 맥락 일치 0건. 다른 키워드를 시도해 보세요.`;
+          return base ? base + msg : msg.trim();
+        });
       }
     } catch {
       // 검색 자체 실패
@@ -228,7 +427,7 @@ export default function PrecedentSearchPage() {
 
     setIsSearching(false);
     setSearchDone(true);
-  }, [searchQuery, contextInput]);
+  }, [searchQuery, contextInput, matchMode]);
 
   // 관련 발췌가 있는 판례를 먼저 표시
   const sortedPrecedents = [...precedents].sort((a, b) => {
@@ -238,10 +437,10 @@ export default function PrecedentSearchPage() {
   });
 
   const matchedCount = precedents.filter((p) => p.excerpts.length > 0).length;
-  const contextKeywords = contextInput
-    .split(/[,\s]+/)
-    .map((k) => k.trim())
-    .filter((k) => k.length > 0);
+  const contextKeywords = [
+    ...contextInput.split(/[,\s]+/).map((k) => k.trim()).filter((k) => k.length > 0),
+    ...extraKeywords,
+  ];
 
   return (
     <div className="h-full flex flex-col bg-gray-50">
@@ -294,6 +493,35 @@ export default function PrecedentSearchPage() {
                 className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-amber-500 focus:border-amber-500 outline-none"
                 onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
               />
+            </div>
+            <div className="w-20">
+              <label className="block text-xs font-medium text-gray-700 mb-1">
+                조건
+              </label>
+              <div className="flex border border-gray-300 rounded-lg overflow-hidden h-[38px]">
+                <button
+                  type="button"
+                  onClick={() => setMatchMode('OR')}
+                  className={`flex-1 text-xs font-medium transition ${
+                    matchMode === 'OR'
+                      ? 'bg-blue-600 text-white'
+                      : 'bg-white text-gray-500 hover:bg-gray-50'
+                  }`}
+                >
+                  OR
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setMatchMode('AND')}
+                  className={`flex-1 text-xs font-medium transition ${
+                    matchMode === 'AND'
+                      ? 'bg-blue-600 text-white'
+                      : 'bg-white text-gray-500 hover:bg-gray-50'
+                  }`}
+                >
+                  AND
+                </button>
+              </div>
             </div>
             <div className="flex items-end">
               <button
@@ -348,6 +576,16 @@ export default function PrecedentSearchPage() {
         </div>
       )}
 
+      {/* 검색어 자동 분리 안내 */}
+      {fallbackInfo && (
+        <div className="bg-amber-50 border-b border-amber-200 px-6 py-2.5 shrink-0">
+          <div className="max-w-5xl mx-auto flex items-center gap-2 text-xs text-amber-800">
+            <span className="shrink-0 text-base">&#128161;</span>
+            <span>{fallbackInfo}</span>
+          </div>
+        </div>
+      )}
+
       {/* 결과 요약 */}
       {searchDone && (
         <div className="bg-white border-b border-gray-200 px-6 py-2.5 shrink-0">
@@ -365,7 +603,13 @@ export default function PrecedentSearchPage() {
                 </span>
                 <span className="text-gray-300">|</span>
                 <span className="text-gray-400">
-                  키워드:{' '}
+                  키워드{contextKeywords.length > 1 && (
+                    <span className={`inline-block px-1 py-0.5 rounded text-[10px] font-bold mx-0.5 ${
+                      matchMode === 'AND' ? 'bg-blue-100 text-blue-700' : 'bg-green-100 text-green-700'
+                    }`}>
+                      {matchMode}
+                    </span>
+                  )}:{' '}
                   {contextKeywords.map((kw, i) => (
                     <span key={i} className="inline-block bg-yellow-100 text-yellow-800 px-1.5 py-0.5 rounded mr-1">
                       {kw}

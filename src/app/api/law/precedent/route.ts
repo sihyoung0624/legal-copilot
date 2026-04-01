@@ -7,6 +7,7 @@ export async function GET(request: NextRequest) {
   const query = request.nextUrl.searchParams.get('query') || '';
   const id = request.nextUrl.searchParams.get('id') || '';
   const display = request.nextUrl.searchParams.get('display') || '5';
+  const page = request.nextUrl.searchParams.get('page') || '1';
 
   try {
     let url: string;
@@ -19,7 +20,7 @@ export async function GET(request: NextRequest) {
       if (!query) {
         return Response.json({ success: false, error: 'query parameter required for search' }, { status: 400 });
       }
-      url = `https://www.law.go.kr/DRF/lawSearch.do?OC=${API_KEY}&target=prec&type=JSON&query=${encodeURIComponent(query)}&display=${display}`;
+      url = `https://www.law.go.kr/DRF/lawSearch.do?OC=${API_KEY}&target=prec&type=JSON&query=${encodeURIComponent(query)}&display=${display}&page=${page}`;
     }
 
     const controller = new AbortController();

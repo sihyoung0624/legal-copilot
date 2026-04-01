@@ -83,7 +83,17 @@ export async function getLawArticle(mst: string, jo: string): Promise<LawArticle
 
     const data = json.data;
 
-    // 조문 데이터 추출 — API 응답 구조에 따라 파싱
+    // API Route가 이미 조문을 필터링해서 반환하는 경우
+    if (data?.lawName !== undefined || data?.articleContent) {
+      return {
+        lawName: data.lawName || '',
+        articleNumber: data.articleNumber || jo,
+        articleTitle: data.articleTitle || '',
+        articleContent: data.articleContent || '',
+      };
+    }
+
+    // 전체 법령 데이터에서 조문 추출 (폴백)
     if (data?.법령?.조문?.조문단위) {
       const articles = Array.isArray(data.법령.조문.조문단위)
         ? data.법령.조문.조문단위
