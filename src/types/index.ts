@@ -167,6 +167,25 @@ export interface CitationVerification {
   source: string;
   relevance: string;
   note: string;
+  url?: string;
+  isLiveVerified?: boolean;
+}
+
+// ===== 실시간 법령/판례 데이터 =====
+export interface LiveLawArticle {
+  lawName: string;
+  articleNumber: string;
+  articleTitle: string;
+  articleContent: string;
+}
+
+export interface LivePrecedent {
+  id: string;
+  caseName: string;
+  caseNumber: string;
+  courtName: string;
+  judgmentDate: string;
+  judgmentType: string;
 }
 
 export interface SupplementRequest {

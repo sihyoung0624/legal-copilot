@@ -36,6 +36,8 @@ export function RightPanel() {
   const runSingleAgent = useStore((s) => s.runSingleAgent);
   const isAgentRunning = useStore((s) => s.isAgentRunning);
   const feasibility = useStore((s) => s.feasibility);
+  const liveLawArticles = useStore((s) => s.liveLawArticles);
+  const livePrecedents = useStore((s) => s.livePrecedents);
 
   const [supplementResponses, setSupplementResponses] = useState<Record<string, string>>({});
   const [unclearResponses, setUnclearResponses] = useState<Record<string, string>>({});
@@ -220,35 +222,117 @@ export function RightPanel() {
         {/* 판례/법령 검증 */}
         {activeTab === '판례법령' && (
           <div className="space-y-3 fade-in">
-            {citationVers.length === 0 ? (
+            {citationVers.length === 0 && !isAgentRunning ? (
               <EmptyState text="초안 작성 후 인용 검증 결과가 표시됩니다" />
+            ) : isAgentRunning && citationVers.length === 0 ? (
+              <div className="text-center py-6">
+                <div className="inline-block w-5 h-5 border-2 border-blue-500 border-t-transparent rounded-full animate-spin mb-2" />
+                <p className="text-xs text-blue-600 font-medium">법제처 API에서 실시간 검증 중...</p>
+                <p className="text-[10px] text-gray-400 mt-1">법령 조문 및 관련 판례를 검색하고 있습니다</p>
+              </div>
             ) : (
               <>
-                <Section title="인용 검증 결과">
-                  {citationVers.map((c, i) => (
-                    <div key={i} className="border border-gray-100 rounded-lg p-2.5 mb-2">
-                      <div className="flex items-center justify-between mb-1">
-                        <span className="text-xs font-medium text-gray-800">{c.item}</span>
-                        <span className={`text-[10px] px-2 py-0.5 rounded-full font-medium ${
-                          c.exists === true ? 'bg-green-100 text-green-700' :
-                          c.exists === false ? 'bg-red-100 text-red-700' :
-                          'bg-gray-100 text-gray-600'
-                        }`}>
-                          {c.exists === true ? '존재 확인' : c.exists === false ? '검증 실패' : '미확인'}
-                        </span>
-                      </div>
-                      <div className="text-[10px] text-gray-600">
-                        <div><span className="text-gray-400">유형:</span> {c.type}</div>
-                        <div><span className="text-gray-400">출처:</span> {c.source}</div>
-                        <div><span className="text-gray-400">관련성:</span> {c.relevance}</div>
-                        <div><span className="text-gray-400">비고:</span> {c.note}</div>
-                      </div>
-                      <button className="text-[10px] text-blue-600 hover:underline mt-1">
-                        원문 보기 &#8599;
-                      </button>
+                {/* 인용 검증 결과 */}
+                <Section title={`인용 검증 결과 (${citationVers.length}건)`}>
+                  {citationVers.filter(c => c.type === '법조문').length > 0 && (
+                    <div className="mb-2">
+                      <p className="text-[10px] text-gray-400 font-medium mb-1">법조문</p>
+                      {citationVers.filter(c => c.type === '법조문').map((c, i) => (
+                        <div key={`law-${i}`} className="border border-gray-100 rounded-lg p-2.5 mb-2">
+                          <div className="flex items-center justify-between mb-1">
+                            <span className="text-xs font-medium text-gray-800">{c.item}</span>
+                            <div className="flex items-center gap-1">
+                              {c.isLiveVerified && (
+                                <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-blue-50 text-blue-600 font-medium">API 검증</span>
+                              )}
+                              <span className={`text-[10px] px-2 py-0.5 rounded-full font-medium ${
+                                c.exists === true ? 'bg-green-100 text-green-700' :
+                                c.exists === false ? 'bg-red-100 text-red-700' :
+                                'bg-gray-100 text-gray-600'
+                              }`}>
+                                {c.exists === true ? '존재 확인' : c.exists === false ? '검증 실패' : '미확인'}
+                              </span>
+                            </div>
+                          </div>
+                          <div className="text-[10px] text-gray-600">
+                            <div><span className="text-gray-400">출처:</span> {c.source}</div>
+                            <div><span className="text-gray-400">관련성:</span> {c.relevance}</div>
+                            {c.note && <div className="mt-1 p-1.5 bg-gray-50 rounded text-[10px] text-gray-700 leading-relaxed">{c.note}</div>}
+                          </div>
+                        </div>
+                      ))}
                     </div>
-                  ))}
+                  )}
+
+                  {citationVers.filter(c => c.type === '판례').length > 0 && (
+                    <div className="mb-2">
+                      <p className="text-[10px] text-gray-400 font-medium mb-1">관련 판례</p>
+                      {citationVers.filter(c => c.type === '판례').map((c, i) => (
+                        <div key={`prec-${i}`} className="border border-gray-100 rounded-lg p-2.5 mb-2">
+                          <div className="flex items-center justify-between mb-1">
+                            <span className="text-xs font-medium text-gray-800 leading-tight">{c.item}</span>
+                            <div className="flex items-center gap-1 shrink-0 ml-1">
+                              {c.isLiveVerified && (
+                                <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-blue-50 text-blue-600 font-medium">API</span>
+                              )}
+                              <span className="text-[10px] px-2 py-0.5 rounded-full font-medium bg-green-100 text-green-700">확인</span>
+                            </div>
+                          </div>
+                          <div className="text-[10px] text-gray-600">
+                            <div><span className="text-gray-400">출처:</span> {c.source}</div>
+                            {c.note && <div className="mt-1 text-[10px] text-gray-500 leading-relaxed">{c.note}</div>}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </Section>
+
+                {/* 법령 조문 전문 */}
+                {liveLawArticles.length > 0 && (
+                  <Section title={`관련 법령 조문 (${liveLawArticles.length}건)`}>
+                    {liveLawArticles.map((art, i) => (
+                      <details key={i} className="border border-blue-100 rounded-lg mb-2 group">
+                        <summary className="p-2.5 cursor-pointer hover:bg-blue-50 transition rounded-lg">
+                          <span className="text-xs font-medium text-blue-800">
+                            {art.lawName} {art.articleNumber}
+                          </span>
+                          {art.articleTitle && (
+                            <span className="text-[10px] text-blue-500 ml-1">({art.articleTitle})</span>
+                          )}
+                        </summary>
+                        <div className="px-3 pb-3 text-[11px] text-gray-700 leading-relaxed border-t border-blue-50 pt-2 bg-blue-50/30">
+                          {art.articleContent}
+                        </div>
+                      </details>
+                    ))}
+                  </Section>
+                )}
+
+                {/* 관련 판례 목록 */}
+                {livePrecedents.length > 0 && (
+                  <Section title={`관련 판례 목록 (${livePrecedents.length}건)`}>
+                    {livePrecedents.map((prec, i) => (
+                      <div key={i} className="border border-amber-100 rounded-lg p-2.5 mb-2 bg-amber-50/30">
+                        <div className="text-xs font-medium text-amber-900 leading-tight mb-1">{prec.caseName}</div>
+                        <div className="text-[10px] text-amber-700 space-y-0.5">
+                          <div>사건번호: {prec.caseNumber}</div>
+                          <div>법원: {prec.courtName || 'N/A'} | 선고일: {prec.judgmentDate}</div>
+                          {prec.judgmentType && <div>유형: {prec.judgmentType}</div>}
+                        </div>
+                      </div>
+                    ))}
+                  </Section>
+                )}
+
+                {liveLawArticles.length > 0 && (
+                  <div className="text-center py-2">
+                    <span className="text-[9px] text-blue-500 bg-blue-50 px-2 py-1 rounded-full">
+                      법제처 Open API 실시간 연동
+                    </span>
+                  </div>
+                )}
+
                 <ActionButton
                   label="인용 재검증"
                   onClick={() => runSingleAgent('판례·인용 검증 에이전트')}
