@@ -7,6 +7,7 @@ import { RightPanel } from '@/components/RightPanel';
 import { ChatPanel } from '@/components/ChatPanel';
 import { CaseModal } from '@/components/CaseModal';
 import { useStore } from '@/store/useStore';
+import Link from 'next/link';
 
 export default function Home() {
   const currentCaseId = useStore((s) => s.currentCaseId);
@@ -34,12 +35,20 @@ export default function Home() {
                 <br />
                 사건을 생성하거나 선택하여 시작하세요.
               </p>
-              <button
-                onClick={() => useStore.getState().setShowCaseModal(true)}
-                className="px-6 py-3 bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700 transition"
-              >
-                + 새 사건 생성
-              </button>
+              <div className="flex gap-3 justify-center">
+                <button
+                  onClick={() => useStore.getState().setShowCaseModal(true)}
+                  className="px-6 py-3 bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700 transition"
+                >
+                  + 새 사건 생성
+                </button>
+                <Link
+                  href="/precedent-search"
+                  className="px-6 py-3 bg-amber-600 text-white rounded-lg font-medium hover:bg-amber-700 transition"
+                >
+                  &#128269; 판례 맥락 검색
+                </Link>
+              </div>
             </div>
           </div>
         )}
