@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useRef } from 'react';
 import Link from 'next/link';
 
 // ─── 타입 ───
@@ -39,6 +39,15 @@ interface Excerpt {
   section: string;
   text: string;
   matchedKeywords: string[];
+}
+
+// 에이전트 워커 상태
+interface AgentStatus {
+  id: number;
+  state: 'idle' | 'fetching' | 'analyzing' | 'done' | 'error';
+  caseName: string;
+  analyzed: number;
+  matched: number;
 }
 
 // ─── 키워드로 판례 텍스트에서 관련 문단 추출 ───
@@ -162,6 +171,26 @@ export default function PrecedentSearchPage() {
   const [extraKeywords, setExtraKeywords] = useState<string[]>([]);
   const [matchMode, setMatchMode] = useState<MatchMode>('OR');
 
+  // 에이전트 대시보드 상태
+  const CONCURRENCY = 10;
+  const [agents, setAgents] = useState<AgentStatus[]>(
+    Array.from({ length: 10 }, (_, i) => ({
+      id: i + 1, state: 'idle' as const, caseName: '', analyzed: 0, matched: 0,
+    })),
+  );
+  const agentStatsRef = useRef({ analyzed: 0, matched: 0 });
+
+  function resetAgents() {
+    agentStatsRef.current = { analyzed: 0, matched: 0 };
+    setAgents(Array.from({ length: 10 }, (_, i) => ({
+      id: i + 1, state: 'idle', caseName: '', analyzed: 0, matched: 0,
+    })));
+  }
+
+  function updateAgent(agentIdx: number, update: Partial<AgentStatus>) {
+    setAgents((prev) => prev.map((a, i) => i === agentIdx ? { ...a, ...update } : a));
+  }
+
   // 판례 검색 API 호출 헬퍼
   async function searchPrecedentAPI(keyword: string, display = 20, page = 1) {
     const res = await fetch(
@@ -184,30 +213,44 @@ export default function PrecedentSearchPage() {
     };
   }
 
-  // 판례 1건 분석 워커
+  // 판례 1건 분석 워커 (에이전트 상태 업데이트 포함)
   async function analyzeOne(
     item: PrecedentListItem,
     contextKeywords: string[],
     mode: MatchMode,
+    agentIdx: number,
   ): Promise<AnalyzedPrecedent> {
+    updateAgent(agentIdx, { state: 'fetching', caseName: item.caseName.substring(0, 20) });
     try {
       const textRes = await fetch(`/api/law/precedent-text?id=${item.id}`);
       const textJson = await textRes.json();
 
+      updateAgent(agentIdx, { state: 'analyzing' });
+
       if (textJson.success && textJson.data) {
         const detail = textJson.data as PrecedentDetail;
         const excerpts = extractExcerpts(detail, contextKeywords, mode);
+        const hasMatch = excerpts.length > 0;
+        agentStatsRef.current.analyzed++;
+        if (hasMatch) agentStatsRef.current.matched++;
+        updateAgent(agentIdx, {
+          state: 'done',
+          analyzed: agentStatsRef.current.analyzed,
+          matched: agentStatsRef.current.matched,
+        });
         return { info: item, detail, loading: false, error: null, excerpts };
       }
+      agentStatsRef.current.analyzed++;
+      updateAgent(agentIdx, { state: 'done', analyzed: agentStatsRef.current.analyzed });
       return { info: item, detail: null, loading: false, error: '전문 조회 실패', excerpts: [] };
     } catch {
+      agentStatsRef.current.analyzed++;
+      updateAgent(agentIdx, { state: 'error', analyzed: agentStatsRef.current.analyzed });
       return { info: item, detail: null, loading: false, error: '네트워크 오류', excerpts: [] };
     }
   }
 
   // 병렬 분석 — CONCURRENCY개의 워커가 동시에 판례를 분석
-  const CONCURRENCY = 10;
-
   async function analyzeBatch(
     items: PrecedentListItem[],
     contextKeywords: string[],
@@ -217,10 +260,11 @@ export default function PrecedentSearchPage() {
     let matchCount = 0;
     let completed = 0;
 
-    // CONCURRENCY개씩 묶어서 병렬 처리
     for (let start = 0; start < items.length; start += CONCURRENCY) {
       const chunk = items.slice(start, start + CONCURRENCY);
-      const promises = chunk.map((item) => analyzeOne(item, contextKeywords, mode));
+      const promises = chunk.map((item, i) =>
+        analyzeOne(item, contextKeywords, mode, i % CONCURRENCY),
+      );
       const results = await Promise.all(promises);
 
       for (const result of results) {
@@ -250,6 +294,7 @@ export default function PrecedentSearchPage() {
     setFallbackInfo(null);
     setExtraKeywords([]);
     setAnalysisProgress({ current: 0, total: 0 });
+    resetAgents();
 
     let extraContextKeywords: string[] = [];
     let searchKeyword = q;
@@ -367,47 +412,44 @@ export default function PrecedentSearchPage() {
         setAnalysisProgress({ current: totalAnalyzed, total: totalToAnalyze });
       }
 
-      // 맥락 일치 0건이고, 원래 검색어에 추가 페이지가 있으면 계속 탐색
+      // 맥락 일치 0건이면 원래 검색어 + 관련 키워드의 추가 페이지를 끝까지 탐색
       if (totalMatched === 0 && hasContextKeywords) {
-        // 이미 로드한 페이지 수 계산 (원래 검색어 기준)
-        const originalResult = await searchPrecedentAPI(searchKeyword, 1);
-        const originalTotal = originalResult.total;
-        let currentPage = Math.ceil(result.items.filter((item) =>
-          !relatedKws.some(() => false) // 원래 검색어 결과의 대략적 페이지 수
-        ).length / 20) + 1;
+        // 탐색할 키워드 목록: 원래 검색어 + 관련 키워드
+        const allSearchKeywords = [searchKeyword, ...relatedKws];
+        const pageTracker = allSearchKeywords.map(() => 2); // 각 키워드의 다음 페이지 (1페이지는 이미 로드)
 
-        const MAX_EXTRA = 500;
-        let extraAnalyzed = 0;
+        let keepSearching = true;
+        while (keepSearching) {
+          keepSearching = false;
 
-        while (extraAnalyzed < MAX_EXTRA && totalAnalyzed < originalTotal + totalToAnalyze) {
-          const nextResult = await searchPrecedentAPI(searchKeyword, 20, currentPage);
-          if (nextResult.items.length === 0) break;
+          for (let ki = 0; ki < allSearchKeywords.length; ki++) {
+            const kw = allSearchKeywords[ki];
+            const nextResult = await searchPrecedentAPI(kw, 20, pageTracker[ki]);
+            if (nextResult.items.length === 0) continue;
 
-          // 이미 분석한 ID 제외
-          const newItems = nextResult.items.filter((item) => !seenIds.has(item.id));
-          for (const item of newItems) seenIds.add(item.id);
+            keepSearching = true;
+            pageTracker[ki]++;
 
-          if (newItems.length > 0) {
-            const { matchCount } = await analyzeBatch(
-              newItems,
-              contextKeywords,
-              totalAnalyzed,
-              matchMode,
-            );
-            totalAnalyzed += newItems.length;
-            totalMatched += matchCount;
-            extraAnalyzed += newItems.length;
+            const newItems = nextResult.items.filter((item) => !seenIds.has(item.id));
+            for (const item of newItems) seenIds.add(item.id);
 
-            setAnalysisProgress({ current: totalAnalyzed, total: totalAnalyzed });
+            if (newItems.length > 0) {
+              const { matchCount } = await analyzeBatch(
+                newItems, contextKeywords, totalAnalyzed, matchMode,
+              );
+              totalAnalyzed += newItems.length;
+              totalMatched += matchCount;
 
-            if (totalMatched > 0) break; // 일치 발견 시 종료
+              setTotalCount(totalAnalyzed);
+              setAnalysisProgress({ current: totalAnalyzed, total: totalAnalyzed });
+
+              if (totalMatched > 0) { keepSearching = false; break; }
+            }
           }
-
-          currentPage++;
 
           setFallbackInfo((prev) => {
             const base = (prev || '').split('\n').filter(line => !line.includes('건 분석')).join('\n');
-            const msg = `\n${totalAnalyzed}건 분석, 맥락 일치 0건 → 추가 탐색 중...`;
+            const msg = `\n${totalAnalyzed}건 분석, 맥락 일치 ${totalMatched}건 → ${totalMatched > 0 ? '완료' : '추가 탐색 중...'}`;
             return base ? base + msg : msg.trim();
           });
         }
@@ -417,7 +459,7 @@ export default function PrecedentSearchPage() {
       if (totalMatched === 0 && hasContextKeywords) {
         setFallbackInfo((prev) => {
           const base = (prev || '').split('\n').filter(line => !line.includes('건 분석')).join('\n');
-          const msg = `\n총 ${totalAnalyzed}건 분석 완료 — 맥락 일치 0건. 다른 키워드를 시도해 보세요.`;
+          const msg = `\n총 ${totalAnalyzed}건 전체 분석 완료 — 맥락 일치 0건. 다른 키워드를 시도해 보세요.`;
           return base ? base + msg : msg.trim();
         });
       }
@@ -551,27 +593,74 @@ export default function PrecedentSearchPage() {
         </div>
       </div>
 
-      {/* 진행 상태 */}
-      {isSearching && analysisProgress.total > 0 && (
-        <div className="bg-blue-50 border-b border-blue-100 px-6 py-2 shrink-0">
-          <div className="max-w-5xl mx-auto flex items-center gap-3">
-            <div className="w-4 h-4 border-2 border-blue-500 border-t-transparent rounded-full animate-spin shrink-0" />
-            <div className="flex-1">
-              <div className="flex justify-between text-xs text-blue-700 mb-1">
-                <span>
-                  판례 전문 분석 중... ({analysisProgress.current}/{analysisProgress.total})
+      {/* 에이전트 대시보드 */}
+      {isSearching && (
+        <div className="bg-gray-900 border-b border-gray-700 px-6 py-3 shrink-0">
+          <div className="max-w-5xl mx-auto">
+            <div className="flex items-center justify-between mb-2">
+              <div className="flex items-center gap-2">
+                <div className="w-2 h-2 bg-green-400 rounded-full animate-pulse" />
+                <span className="text-xs font-mono text-green-400">
+                  AGENT DASHBOARD — {CONCURRENCY} workers
                 </span>
-                <span>{Math.round((analysisProgress.current / analysisProgress.total) * 100)}%</span>
               </div>
-              <div className="w-full bg-blue-200 rounded-full h-1.5">
-                <div
-                  className="bg-blue-600 h-1.5 rounded-full transition-all duration-300"
-                  style={{
-                    width: `${(analysisProgress.current / analysisProgress.total) * 100}%`,
-                  }}
-                />
+              <div className="flex items-center gap-4 text-[10px] font-mono">
+                <span className="text-gray-400">
+                  분석: <span className="text-white">{analysisProgress.current}</span>건
+                </span>
+                <span className="text-gray-400">
+                  일치: <span className="text-amber-400">{matchedCount}</span>건
+                </span>
               </div>
             </div>
+            <div className="grid grid-cols-5 gap-1.5">
+              {agents.map((agent) => (
+                <div
+                  key={agent.id}
+                  className={`rounded px-2 py-1.5 text-[10px] font-mono transition-all duration-300 ${
+                    agent.state === 'idle'
+                      ? 'bg-gray-800 text-gray-500'
+                      : agent.state === 'fetching'
+                      ? 'bg-blue-900/50 text-blue-300 border border-blue-700'
+                      : agent.state === 'analyzing'
+                      ? 'bg-amber-900/50 text-amber-300 border border-amber-700'
+                      : agent.state === 'error'
+                      ? 'bg-red-900/50 text-red-400'
+                      : 'bg-gray-800 text-gray-400'
+                  }`}
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="font-bold">#{agent.id}</span>
+                    <span className={`w-1.5 h-1.5 rounded-full ${
+                      agent.state === 'idle' ? 'bg-gray-600'
+                      : agent.state === 'fetching' ? 'bg-blue-400 animate-pulse'
+                      : agent.state === 'analyzing' ? 'bg-amber-400 animate-pulse'
+                      : agent.state === 'error' ? 'bg-red-400'
+                      : 'bg-green-400'
+                    }`} />
+                  </div>
+                  <div className="truncate mt-0.5 opacity-80">
+                    {agent.state === 'idle' && '대기'}
+                    {agent.state === 'fetching' && `${agent.caseName}...`}
+                    {agent.state === 'analyzing' && '분석 중'}
+                    {agent.state === 'done' && '완료'}
+                    {agent.state === 'error' && '오류'}
+                  </div>
+                </div>
+              ))}
+            </div>
+            {analysisProgress.total > 0 && (
+              <div className="mt-2">
+                <div className="w-full bg-gray-700 rounded-full h-1">
+                  <div
+                    className="bg-green-500 h-1 rounded-full transition-all duration-300"
+                    style={{
+                      width: `${Math.min((analysisProgress.current / analysisProgress.total) * 100, 100)}%`,
+                    }}
+                  />
+                </div>
+              </div>
+            )}
           </div>
         </div>
       )}
